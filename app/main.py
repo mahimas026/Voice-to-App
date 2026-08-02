@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
+load_dotenv(ROOT.parent / ".env")
 
 SYSTEM_PROMPT = """You are a strict app-spec extractor. You convert a spoken (transcribed) app description into a JSON object matching this exact schema — nothing more, nothing less:
 {
