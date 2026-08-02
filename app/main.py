@@ -1,12 +1,13 @@
 import json
 import os
+import shutil
 import re
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -68,7 +69,8 @@ class AppSpec(BaseModel):
 
 
 class ParseRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=10_000)
+    transcript: str = Field(min_length=1, max_length=10_000)
+    clarification_answer: str | None = Field(default=None, max_length=2_000)
 
 
 async def call_llm(text: str, stricter: bool = False) -> str:
@@ -110,6 +112,10 @@ async def parse_spec(text: str) -> AppSpec:
     raise HTTPException(422, "Sorry, I couldn't understand that clearly — could you describe your app idea again?")
 
 
+class BuildRequest(AppSpec):
+    pass
+
+
 app = FastAPI(title="voice-to-app")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -119,6 +125,58 @@ async def home() -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
 
-@app.post("/parse-spec", response_model=AppSpec)
+@app.post("/api/parse-spec", response_model=AppSpec)
 async def parse_spec_endpoint(request: ParseRequest) -> AppSpec:
-    return await parse_spec(request.text.strip())
+    transcript = request.transcript.strip()
+    if request.clarification_answer:
+        transcript += f"\n\nAdditional clarification from the user: {request.clarification_answer.strip()}"
+    return await parse_spec(transcript)
+
+
+@app.post("/api/build-app")
+async def build_app(request: BuildRequest) -> JSONResponse:
+    from .generator import GENERATED_ROOT, app_id_for, build_project, file_tree, write_project
+
+    app_id = app_id_for(request)
+    destination = GENERATED_ROOT / app_id
+    try:
+        write_project(request, destination)
+        success, log = build_project(destination)
+        if not success:
+            return JSONResponse({"success": False, "error": log[-3000:]}, status_code=422)
+        return JSONResponse({
+            "success": True,
+            "app_id": app_id,
+            "file_tree": file_tree(destination),
+            "summary": f"Generated {request.app_name}, a React app for managing {request.entities[0].name.lower()} entries with localStorage persistence.",
+            "preview_url": f"/api/preview/{app_id}/",
+            "build_log": log,
+        })
+    except Exception as error:
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        return JSONResponse({"success": False, "error": str(error)}, status_code=500)
+
+
+def generated_project(app_id: str) -> Path:
+    from .generator import GENERATED_ROOT
+    target = (GENERATED_ROOT / app_id).resolve()
+    if target.parent != GENERATED_ROOT.resolve() or not target.is_dir():
+        raise HTTPException(404, "Generated app not found")
+    return target
+
+
+@app.get("/api/preview/{app_id}/{asset_path:path}")
+async def preview(app_id: str, asset_path: str = "") -> FileResponse:
+    root = generated_project(app_id) / "dist"
+    candidate = (root / (asset_path or "index.html")).resolve()
+    if candidate.is_file() and candidate.is_relative_to(root.resolve()):
+        return FileResponse(candidate)
+    return FileResponse(root / "index.html")
+
+
+@app.get("/api/download/{app_id}")
+async def download(app_id: str) -> FileResponse:
+    project = generated_project(app_id)
+    archive = shutil.make_archive(str(project), "zip", project)
+    return FileResponse(archive, media_type="application/zip", filename=f"{app_id}.zip")
